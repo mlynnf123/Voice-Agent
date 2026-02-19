@@ -16,6 +16,7 @@ dotenv.config();
 
 const {
     OPENAI_API_KEY,
+    DEEPGRAM_API_KEY,
     CARTESIA_API_KEY,
     TWILIO_ACCOUNT_SID,
     TWILIO_AUTH_TOKEN,
@@ -24,6 +25,7 @@ const {
 } = process.env;
 
 if (!OPENAI_API_KEY) { console.error('Missing OPENAI_API_KEY'); process.exit(1); }
+if (!DEEPGRAM_API_KEY) { console.error('Missing DEEPGRAM_API_KEY'); process.exit(1); }
 if (!CARTESIA_API_KEY) { console.error('Missing CARTESIA_API_KEY'); process.exit(1); }
 if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) { console.error('Missing Twilio creds'); process.exit(1); }
 if (!SERVER_URL) { console.error('Missing SERVER_URL'); process.exit(1); }
@@ -401,7 +403,7 @@ function sendCartesiaTTS(cartesiaWs, text, contextId, config = {}, emotion = nul
 // ── Routes ──────────────────────────────────────────────────────────────────
 
 fastify.get('/', async (req, reply) => {
-    reply.send({ message: 'Voice Agent is running!', tools: ['book_meeting'], pipeline: 'Cartesia STT → GPT-4o → Cartesia TTS' });
+    reply.send({ message: 'Voice Agent is running!', tools: ['book_meeting'], pipeline: 'Deepgram STT → GPT-4o → Cartesia TTS' });
 });
 
 fastify.post('/make-call', async (request, reply) => {
@@ -498,96 +500,102 @@ fastify.register(async (fastify) => {
         let cartesiaReady = false;
         let isSpeaking = false;         // true while TTS audio is being sent to Twilio
         let lastAudioSentAt = 0;        // timestamp of last audio chunk sent to Twilio
-        let lastTTSPlaybackEndEstimate = 0; // estimated time when TTS audio finishes playing on the phone
         let currentContextId = null;     // Cartesia context_id for current TTS
         let ttsAborted = false;          // flag to stop sending audio after interruption
-        let ttsBytesSent = 0;            // track bytes sent per TTS chunk for playback estimation
-        let ttsChunkStartTime = 0;       // when we started sending current TTS chunk
 
-        // Cartesia STT WebSocket
-        let cartesiaSTTWs = null;
-        let cartesiaSTTReady = false;
-        let pendingAudioChunks = []; // buffer audio until Cartesia STT is ready
+        // Deepgram WebSocket
+        let deepgramWs = null;
 
-        // ── Connect to Cartesia STT (Ink-Whisper) ───────────────────────
-        function connectCartesiaSTT() {
-            const sttUrl = `wss://api.cartesia.ai/stt/websocket?api_key=${CARTESIA_API_KEY}&cartesia_version=2025-04-16&model=ink-whisper&language=en&encoding=pcm_mulaw&sample_rate=8000`;
-            cartesiaSTTWs = new WebSocket(sttUrl);
+        let deepgramReady = false;
+        let pendingAudioChunks = []; // buffer audio until Deepgram is ready
 
-            cartesiaSTTWs.on('open', () => {
-                console.log('✅ Connected to Cartesia STT (Ink-Whisper)');
-                cartesiaSTTReady = true;
-                // Flush any audio that arrived before STT was ready
+        // ── Connect to Deepgram STT ──────────────────────────────────────
+        function connectDeepgram() {
+            const dgEndpointing = agent?.endpointingMs ?? 300;
+            const dgUtteranceEnd = agent?.utteranceEndMs ?? 1000;
+            const dgUrl = `wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&model=nova-2&punctuate=true&interim_results=true&endpointing=${dgEndpointing}&utterance_end_ms=${dgUtteranceEnd}`;
+            deepgramWs = new WebSocket(dgUrl, {
+                headers: { 'Authorization': `Token ${DEEPGRAM_API_KEY}` },
+            });
+
+            deepgramWs.on('open', () => {
+                console.log('✅ Connected to Deepgram STT');
+                deepgramReady = true;
+                // Flush any audio that arrived before Deepgram was ready
                 for (const chunk of pendingAudioChunks) {
-                    cartesiaSTTWs.send(chunk);
+                    deepgramWs.send(chunk);
                 }
                 pendingAudioChunks = [];
             });
 
-            cartesiaSTTWs.on('message', (data) => {
+            deepgramWs.on('message', (data) => {
                 try {
-                    const msg = JSON.parse(data.toString());
+                    const msg = JSON.parse(data);
 
-                    if (msg.type === 'transcript' && msg.is_final) {
-                        const transcript = (msg.words || []).map(w => w.word).join('').trim();
+                    // Handle speech_started — interrupt TTS
+                    if (msg.type === 'Metadata' && msg.speech_final !== undefined) {
+                        // Not a speech_started event, ignore
+                    }
+
+                    // Deepgram sends speech_started events
+                    if (msg.type === 'SpeechStarted') {
+                        handleSpeechStarted();
+                        return;
+                    }
+
+                    // Utterance end — finalize whatever we've accumulated
+                    if (msg.type === 'UtteranceEnd') {
+                        clearTimeout(finalTimer); // cancel fast-flush, utterance_end wins
+                        if (transcriptBuffer.trim()) {
+                            const utterance = transcriptBuffer.trim();
+                            transcriptBuffer = '';
+                            console.log(`🗣️ User (utterance_end): "${utterance}"`);
+                            handleUserUtterance(utterance);
+                        }
+                        return;
+                    }
+
+                    // Transcript results
+                    if (msg.channel && msg.channel.alternatives && msg.channel.alternatives.length > 0) {
+                        const transcript = msg.channel.alternatives[0].transcript;
                         if (!transcript) return;
 
-                        // If greeting hasn't been sent yet, caller just spoke — send greeting now
-                        if (!greetingSent) {
-                            console.log(`📞 Caller spoke: "${transcript}" — sending greeting`);
-                            sendGreeting();
-                            return; // Don't process their "hello" as a real utterance
+                        if (msg.is_final) {
+                            transcriptBuffer += (transcriptBuffer ? ' ' : '') + transcript;
+                            console.log(`📝 Deepgram (final): "${transcript}"`);
+
+                            if (msg.speech_final) {
+                                // speech_final = Deepgram is confident they stopped talking
+                                // Act immediately for any length
+                                clearTimeout(finalTimer);
+                                if (transcriptBuffer.trim()) {
+                                    const utterance = transcriptBuffer.trim();
+                                    transcriptBuffer = '';
+                                    console.log(`🗣️ User (speech_final): "${utterance}"`);
+                                    handleUserUtterance(utterance);
+                                }
+                            } else {
+                                // is_final but NOT speech_final — they might still be talking
+                                // Set a 600ms timer as fallback
+                                clearTimeout(finalTimer);
+                                finalTimer = setTimeout(() => {
+                                    if (transcriptBuffer.trim()) {
+                                        const utterance = transcriptBuffer.trim();
+                                        transcriptBuffer = '';
+                                        console.log(`🗣️ User (timer): "${utterance}"`);
+                                        handleUserUtterance(utterance);
+                                    }
+                                }, 600);
+                            }
                         }
-
-                        // Echo guard: while agent is speaking, only allow through if text-based echo check passes
-                        if (isSpeaking) {
-                            // Check if this could be a user interruption (not echo)
-                            if (isEcho(transcript)) {
-                                console.log(`🔇 Echo discarded (speaking): "${transcript}"`);
-                                return;
-                            }
-                            // Not echo — user is interrupting. Let it through and cancel TTS.
-                            console.log(`🗣️ User interrupting: "${transcript}"`);
-                            ttsAborted = true;
-                            isSpeaking = false;
-                            ttsPlaying = false;
-                            ttsQueue = [];
-                            // Cancel Cartesia TTS context
-                            if (cartesiaWs && cartesiaReady && currentContextId) {
-                                cartesiaWs.send(JSON.stringify({ cancel: { context_id: currentContextId } }));
-                            }
-                            // Clear Twilio audio buffer
-                            if (streamSid) {
-                                connection.send(JSON.stringify({ event: 'clear', streamSid }));
-                            }
-                        }
-
-                        transcriptBuffer += (transcriptBuffer ? ' ' : '') + transcript;
-                        console.log(`📝 Cartesia STT (final): "${transcript}"`);
-
-                        // Cartesia doesn't have speech_final/utterance_end like Deepgram,
-                        // so use a timer approach: reset a 700ms timer on each final transcript.
-                        // If no new transcript arrives within 700ms, flush buffer.
-                        clearTimeout(finalTimer);
-                        finalTimer = setTimeout(() => {
-                            if (transcriptBuffer.trim()) {
-                                const utterance = transcriptBuffer.trim();
-                                transcriptBuffer = '';
-                                console.log(`🗣️ User (timer): "${utterance}"`);
-                                handleUserUtterance(utterance);
-                            }
-                        }, 700);
                     }
                 } catch (err) {
-                    console.error('❌ Cartesia STT message parse error:', err);
+                    console.error('❌ Deepgram message parse error:', err);
                 }
             });
 
-            cartesiaSTTWs.on('close', () => {
-                console.log('🔌 Cartesia STT disconnected');
-                cartesiaSTTReady = false;
-            });
-            cartesiaSTTWs.on('error', (err) => console.error('❌ Cartesia STT error:', err));
+            deepgramWs.on('close', () => console.log('🔌 Deepgram disconnected'));
+            deepgramWs.on('error', (err) => console.error('❌ Deepgram error:', err));
         }
 
         // ── Connect to Cartesia TTS ──────────────────────────────────────
@@ -609,55 +617,38 @@ fastify.register(async (fastify) => {
                         if (ttsAborted) return; // interrupted — discard
 
                         if (streamSid) {
-                            const audioBytes = Buffer.from(msg.data, 'base64');
                             connection.send(JSON.stringify({
                                 event: 'media',
                                 streamSid,
                                 media: { payload: msg.data },
                             }));
                             lastAudioSentAt = Date.now();
-                            ttsBytesSent += audioBytes.length;
-                            if (!ttsChunkStartTime) ttsChunkStartTime = Date.now();
                         }
                     } else if (msg.type === 'done' || msg.done) {
-                        // Estimate when this audio finishes playing on the phone
-                        // mulaw 8kHz = 8000 bytes/sec; account for network buffering
-                        const playbackDurationMs = (ttsBytesSent / 8000) * 1000;
-                        const sendDurationMs = Date.now() - (ttsChunkStartTime || Date.now());
-                        const remainingPlaybackMs = Math.max(0, playbackDurationMs - sendDurationMs);
-                        lastTTSPlaybackEndEstimate = Date.now() + remainingPlaybackMs;
-                        console.log(`🔊 Cartesia TTS chunk complete (${(playbackDurationMs/1000).toFixed(1)}s audio, ~${(remainingPlaybackMs/1000).toFixed(1)}s still playing)`);
-                        ttsBytesSent = 0;
-                        ttsChunkStartTime = 0;
-                        // Keep isSpeaking true until the audio finishes playing on the phone
-                        // plus a buffer for echo. Audio plays at 8000 bytes/sec (mulaw 8kHz).
-                        const echoGuardMs = remainingPlaybackMs + 500; // wait for playback + 0.5s echo buffer
-                        console.log(`🔇 Echo guard: ${(echoGuardMs/1000).toFixed(1)}s`);
-                        
+                        console.log('🔊 Cartesia TTS chunk complete');
                         if (!greetingDone) {
+                            // Greeting finished — wait for echo to clear then start listening
                             setTimeout(() => {
                                 isSpeaking = false;
                                 ttsPlaying = false;
                                 greetingDone = true;
-                                lastAudioSentAt = Date.now();
                                 console.log('✅ Greeting done, now listening');
                                 if (ttsQueue.length > 0) playNextTTS();
-                            }, echoGuardMs);
+                            }, 1200);
                         } else {
+                            // Normal sentence — delay for echo, then next
                             if (ttsQueue.length > 0) {
-                                // More sentences queued — just wait for playback, short gap
+                                // More sentences queued — short gap between sentences
                                 setTimeout(() => {
                                     isSpeaking = false;
                                     playNextTTS();
-                                }, Math.max(remainingPlaybackMs, 150));
+                                }, 150);
                             } else {
-                                // Last sentence — wait for full playback + echo buffer
+                                // Last sentence — longer echo guard before listening
                                 setTimeout(() => {
                                     isSpeaking = false;
                                     ttsPlaying = false;
-                                    lastAudioSentAt = Date.now();
-                                    console.log('👂 Listening again');
-                                }, echoGuardMs);
+                                }, 800);
                             }
                         }
                     }
@@ -710,9 +701,6 @@ fastify.register(async (fastify) => {
         // ── Handle a complete user utterance ─────────────────────────────
                 let lastAgentText = '';  // track last agent response for echo detection
         let greetingDone = false; // don't listen until greeting + echo clears
-        let greetingSent = false;
-        let greetingTimeout = null;
-        let sendGreeting = () => {}; // will be set in initializeSession
 
         // Keep a rolling buffer of all recent agent text for echo detection
         let recentAgentTexts = [];
@@ -913,31 +901,19 @@ fastify.register(async (fastify) => {
                 greetingFull = `Hey ${firstName}, this is Jamie calling from J&J Roofing Pros. I was hoping to ask a quick question about the property at ${address}. Are you the owner?`;
             }
 
-            // Wait for the person to say something OR 6 seconds, then greet
-            sendGreeting = function() {
-                if (greetingSent) return;
-                greetingSent = true;
-                if (greetingTimeout) clearTimeout(greetingTimeout);
-                console.log(`👋 Greeting: "${greetingFull}"`);
-                messages.push({ role: 'assistant', content: greetingFull });
-                speakText(greetingFull, 'enthusiastic');
-            }
-
-            // Start the 6-second fallback timer once STT+TTS are ready
+            // Send greeting as one chunk with enthusiastic emotion
             const greetingCheck = setInterval(() => {
-                if (cartesiaSTTReady && cartesiaReady) {
+                if (deepgramReady && cartesiaReady) {
                     clearInterval(greetingCheck);
-                    console.log('🤖 Waiting for caller to speak (or 6s timeout)...');
-                    greetingTimeout = setTimeout(() => {
-                        console.log('⏰ 6s timeout — sending greeting');
-                        sendGreeting();
-                    }, 4000);
+                    setTimeout(() => {
+                        if (messages.length > 1) return;
+                        console.log(`👋 Greeting: "${greetingFull}"`);
+                        messages.push({ role: 'assistant', content: greetingFull });
+                        speakText(greetingFull, 'enthusiastic');
+                    }, 800);
                 }
             }, 200);
-            setTimeout(() => clearInterval(greetingCheck), 15000);
-
-            // Hook: when first transcript arrives, send greeting immediately
-            // We'll set this flag and check it in the transcript handler
+            setTimeout(() => clearInterval(greetingCheck), 10000);
         }
 
         // ── Twilio WebSocket handlers ────────────────────────────────────
@@ -946,16 +922,16 @@ fastify.register(async (fastify) => {
                 const data = JSON.parse(message);
                 switch (data.event) {
                     case 'media':
-                        // Forward audio to Cartesia STT — but NOT while agent is speaking (prevents echo feedback)
+                        // Forward audio to Deepgram — but NOT while agent is speaking (prevents echo feedback)
                         const audioBuffer = Buffer.from(data.media.payload, 'base64');
-                        if (!greetingDone) {
-                            // Greeting hasn't finished — skip
+                        if (!greetingDone || isSpeaking) {
+                            // Greeting hasn't finished + echo cleared, or agent is talking — skip
                             break;
                         }
-                        if (cartesiaSTTReady && cartesiaSTTWs && cartesiaSTTWs.readyState === WebSocket.OPEN) {
-                            cartesiaSTTWs.send(audioBuffer);
+                        if (deepgramReady && deepgramWs && deepgramWs.readyState === WebSocket.OPEN) {
+                            deepgramWs.send(audioBuffer);
                         } else {
-                            // Buffer until Cartesia STT connects (keep last 2s ~ 16000 bytes at 8kHz)
+                            // Buffer until Deepgram connects (keep last 2s ~ 16000 bytes at 8kHz)
                             pendingAudioChunks.push(audioBuffer);
                             if (pendingAudioChunks.length > 100) pendingAudioChunks.shift();
                         }
@@ -982,7 +958,7 @@ fastify.register(async (fastify) => {
 
                         // Initialize everything now that we have call params
                         initializeSession();
-                        connectCartesiaSTT();
+                        connectDeepgram();
                         connectCartesiaTTS();
                         break;
                     case 'mark':
@@ -1000,8 +976,10 @@ fastify.register(async (fastify) => {
 
         connection.on('close', () => {
             console.log('🔌 Client disconnected.');
-            if (cartesiaSTTWs && cartesiaSTTWs.readyState === WebSocket.OPEN) {
-                cartesiaSTTWs.close();
+            if (deepgramWs && deepgramWs.readyState === WebSocket.OPEN) {
+                // Send close frame to Deepgram to finalize
+                deepgramWs.send(JSON.stringify({ type: 'CloseStream' }));
+                deepgramWs.close();
             }
             if (cartesiaWs && cartesiaWs.readyState === WebSocket.OPEN) {
                 cartesiaWs.close();
@@ -1013,7 +991,7 @@ fastify.register(async (fastify) => {
 fastify.listen({ port: PORT, host: '0.0.0.0' }, (err) => {
     if (err) { console.error(err); process.exit(1); }
     console.log(`\n🏠 Voice Agent listening on port ${PORT}`);
-    console.log(`🔊 Pipeline: Cartesia STT (Ink-Whisper) → GPT-4o → Cartesia TTS`);
+    console.log(`🔊 Pipeline: Deepgram STT → GPT-4o → Cartesia TTS`);
     console.log(`📞 Make calls: POST ${SERVER_URL}/make-call`);
     console.log(`🤖 Multi-agent: agents loaded from agents.json`);
     console.log(`🔧 Tools: book_meeting (Cal.com)\n`);
