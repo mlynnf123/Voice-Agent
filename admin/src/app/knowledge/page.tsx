@@ -1,90 +1,84 @@
 "use client"
 
-import { useEffect, useState, useRef } from "react"
+import { useEffect, useState } from "react"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Textarea } from "@/components/ui/textarea"
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Label } from "@/components/ui/label"
-
-interface KnowledgeFile {
-  name: string
-  size: number
-  modified: string
-}
+import { apiFetch, apiJson } from "@/lib/api"
 
 interface Agent {
+  id: string
   name: string
-  knowledgeFolder: string
+}
+
+interface KBEntry {
+  id: number
+  agent_id: string
+  title: string
+  content: string
+  created_at: string
 }
 
 export default function KnowledgePage() {
-  const [agents, setAgents] = useState<Record<string, Agent>>({})
+  const [agents, setAgents] = useState<Agent[]>([])
   const [agentId, setAgentId] = useState("")
-  const [files, setFiles] = useState<KnowledgeFile[]>([])
-  const [uploading, setUploading] = useState(false)
-  const fileInputRef = useRef<HTMLInputElement>(null)
+  const [entries, setEntries] = useState<KBEntry[]>([])
+  const [newTitle, setNewTitle] = useState("")
+  const [newContent, setNewContent] = useState("")
+  const [adding, setAdding] = useState(false)
 
   useEffect(() => {
-    fetch("/api/agents")
-      .then((r) => r.json())
-      .then((data) => {
-        setAgents(data)
-        const ids = Object.keys(data)
-        if (ids.length === 1) setAgentId(ids[0])
+    apiJson<{ agents: Agent[] }>("/agents")
+      .then((d) => {
+        setAgents(d.agents)
+        if (d.agents.length === 1) setAgentId(d.agents[0].id)
       })
       .catch(() => {})
   }, [])
 
-  const loadFiles = () => {
+  const loadEntries = () => {
     if (!agentId) return
-    fetch(`/api/knowledge/list?agentId=${agentId}`)
-      .then((r) => r.json())
-      .then(setFiles)
+    apiJson<{ entries: KBEntry[] }>(`/agents/${agentId}/knowledge`)
+      .then((d) => setEntries(d.entries))
       .catch(() => {})
   }
 
   useEffect(() => {
-    loadFiles()
+    loadEntries()
   }, [agentId])
+
+  const handleAdd = async () => {
+    if (!newTitle || !newContent || !agentId) return
+    setAdding(true)
+    await apiFetch(`/agents/${agentId}/knowledge`, {
+      method: "POST",
+      body: JSON.stringify({ title: newTitle, content: newContent }),
+    })
+    setNewTitle("")
+    setNewContent("")
+    setAdding(false)
+    loadEntries()
+  }
 
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file || !agentId) return
-
-    setUploading(true)
-    const formData = new FormData()
-    formData.append("file", file)
-    formData.append("agentId", agentId)
-
-    await fetch("/api/knowledge/upload", {
+    const text = await file.text()
+    const title = file.name.replace(/\.(txt|md)$/, "")
+    await apiFetch(`/agents/${agentId}/knowledge`, {
       method: "POST",
-      body: formData,
+      body: JSON.stringify({ title, content: text }),
     })
-
-    setUploading(false)
-    loadFiles()
-    if (fileInputRef.current) fileInputRef.current.value = ""
+    loadEntries()
+    e.target.value = ""
   }
 
-  const handleDelete = async (filename: string) => {
-    await fetch("/api/knowledge/delete", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ filename, agentId }),
-    })
-    loadFiles()
-  }
-
-  const formatSize = (bytes: number) => {
-    if (bytes < 1024) return `${bytes} B`
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  const handleDelete = async (kbId: number) => {
+    await apiFetch(`/agents/${agentId}/knowledge/${kbId}`, { method: "DELETE" })
+    loadEntries()
   }
 
   return (
@@ -98,10 +92,8 @@ export default function KnowledgePage() {
             <SelectValue placeholder="Select an agent" />
           </SelectTrigger>
           <SelectContent>
-            {Object.entries(agents).map(([id, agent]) => (
-              <SelectItem key={id} value={id}>
-                {agent.name}
-              </SelectItem>
+            {agents.map((a) => (
+              <SelectItem key={a.id} value={a.id}>{a.name}</SelectItem>
             ))}
           </SelectContent>
         </Select>
@@ -111,57 +103,45 @@ export default function KnowledgePage() {
         <>
           <Card className="mb-6">
             <CardHeader>
-              <CardTitle className="text-sm font-medium">Upload Document</CardTitle>
-              <CardDescription>
-                Upload .txt or .md files. Content will be injected into the system prompt as context.
-              </CardDescription>
+              <CardTitle className="text-sm font-medium">Add Entry</CardTitle>
+              <CardDescription>Paste text or upload a .txt/.md file.</CardDescription>
             </CardHeader>
-            <CardContent>
+            <CardContent className="space-y-3">
+              <Input value={newTitle} onChange={(e) => setNewTitle(e.target.value)} placeholder="Title" />
+              <Textarea value={newContent} onChange={(e) => setNewContent(e.target.value)} placeholder="Paste content..." className="min-h-[100px] text-xs" />
               <div className="flex items-center gap-3">
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept=".txt,.md"
-                  onChange={handleUpload}
-                  className="text-sm text-muted-foreground file:mr-3 file:border file:border-border file:bg-transparent file:px-3 file:py-1.5 file:text-sm file:text-foreground file:cursor-pointer"
-                />
-                {uploading && <span className="text-sm text-muted-foreground">Uploading...</span>}
+                <Button variant="outline" size="sm" onClick={handleAdd} disabled={adding || !newTitle || !newContent}>
+                  {adding ? "Adding..." : "Add Entry"}
+                </Button>
+                <span className="text-xs text-muted-foreground">or</span>
+                <input type="file" accept=".txt,.md" onChange={handleUpload} className="text-sm text-muted-foreground file:mr-3 file:border file:border-border file:bg-transparent file:px-3 file:py-1.5 file:text-sm file:text-foreground file:cursor-pointer" />
               </div>
             </CardContent>
           </Card>
 
           <Card>
             <CardHeader>
-              <CardTitle className="text-sm font-medium">Documents</CardTitle>
+              <CardTitle className="text-sm font-medium">Entries ({entries.length})</CardTitle>
             </CardHeader>
             <CardContent>
-              {files.length === 0 ? (
-                <p className="text-sm text-muted-foreground">No documents uploaded yet.</p>
+              {entries.length === 0 ? (
+                <p className="text-sm text-muted-foreground">No entries yet.</p>
               ) : (
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b border-border text-left">
-                      <th className="pb-2 font-medium text-muted-foreground">Name</th>
+                      <th className="pb-2 font-medium text-muted-foreground">Title</th>
                       <th className="pb-2 font-medium text-muted-foreground">Size</th>
-                      <th className="pb-2 font-medium text-muted-foreground">Modified</th>
                       <th className="pb-2 font-medium text-muted-foreground"></th>
                     </tr>
                   </thead>
                   <tbody>
-                    {files.map((file) => (
-                      <tr key={file.name} className="border-b border-border last:border-0">
-                        <td className="py-2">{file.name}</td>
-                        <td className="py-2 text-muted-foreground">{formatSize(file.size)}</td>
-                        <td className="py-2 text-muted-foreground">
-                          {new Date(file.modified).toLocaleDateString()}
-                        </td>
+                    {entries.map((entry) => (
+                      <tr key={entry.id} className="border-b border-border last:border-0">
+                        <td className="py-2">{entry.title}</td>
+                        <td className="py-2 text-muted-foreground">{(entry.content?.length || 0).toLocaleString()} chars</td>
                         <td className="py-2 text-right">
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => handleDelete(file.name)}
-                            className="text-muted-foreground hover:text-destructive"
-                          >
+                          <Button variant="ghost" size="sm" onClick={() => handleDelete(entry.id)} className="text-muted-foreground hover:text-destructive">
                             Delete
                           </Button>
                         </td>

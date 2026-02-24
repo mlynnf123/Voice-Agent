@@ -4,12 +4,14 @@ import { useEffect, useState } from "react"
 import { useRouter } from "next/navigation"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { apiFetch, apiJson } from "@/lib/api"
 
 interface Agent {
   id: string
   name: string
-  fromNumber: string
-  cartesiaVoiceName: string
+  company: string
+  phone_number: string
+  voice_id: string
   active: boolean
 }
 
@@ -19,15 +21,8 @@ export default function AgentsPage() {
   const router = useRouter()
 
   const loadAgents = () => {
-    fetch("/api/agents")
-      .then((r) => r.json())
-      .then((data) => {
-        const list = Object.entries(data).map(([id, agent]) => ({
-          id,
-          ...(agent as Omit<Agent, "id">),
-        }))
-        setAgents(list)
-      })
+    apiJson<{ agents: Agent[] }>("/agents")
+      .then((d) => setAgents(d.agents))
       .catch(() => {})
   }
 
@@ -38,26 +33,16 @@ export default function AgentsPage() {
   const handleDelete = async (id: string, name: string) => {
     if (!confirm(`Delete agent "${name}"? This cannot be undone.`)) return
     setDeleting(id)
-    await fetch(`/api/agents/${id}`, { method: "DELETE" })
+    await apiFetch(`/agents/${id}`, { method: "DELETE" })
     setDeleting(null)
     loadAgents()
-  }
-
-  const handleCreate = async () => {
-    const resp = await fetch("/api/agents", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "New Agent" }),
-    })
-    const data = await resp.json()
-    router.push(`/agents/${data.id}`)
   }
 
   return (
     <div className="max-w-4xl">
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-lg font-semibold">Agents</h1>
-        <Button variant="outline" onClick={handleCreate}>
+        <Button variant="outline" onClick={() => router.push("/agents/new")}>
           Create Agent
         </Button>
       </div>
@@ -74,8 +59,8 @@ export default function AgentsPage() {
               <thead>
                 <tr className="border-b border-border text-left">
                   <th className="pb-2 font-medium text-muted-foreground">Name</th>
+                  <th className="pb-2 font-medium text-muted-foreground">Company</th>
                   <th className="pb-2 font-medium text-muted-foreground">Phone Number</th>
-                  <th className="pb-2 font-medium text-muted-foreground">Voice</th>
                   <th className="pb-2 font-medium text-muted-foreground">Status</th>
                   <th className="pb-2 font-medium text-muted-foreground"></th>
                 </tr>
@@ -91,20 +76,12 @@ export default function AgentsPage() {
                         {agent.name}
                       </button>
                     </td>
+                    <td className="py-2 text-muted-foreground">{agent.company}</td>
                     <td className="py-2 text-muted-foreground font-mono text-xs">
-                      {agent.fromNumber || "---"}
-                    </td>
-                    <td className="py-2 text-muted-foreground">
-                      {agent.cartesiaVoiceName || "---"}
+                      {agent.phone_number || "---"}
                     </td>
                     <td className="py-2">
-                      <span
-                        className={
-                          agent.active
-                            ? "text-green-500"
-                            : "text-muted-foreground"
-                        }
-                      >
+                      <span className={agent.active ? "text-green-500" : "text-muted-foreground"}>
                         {agent.active ? "Active" : "Inactive"}
                       </span>
                     </td>

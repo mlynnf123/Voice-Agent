@@ -8,8 +8,9 @@ const links = [
   { href: "/agents", label: "Agents" },
   { href: "/", label: "Dashboard" },
   { href: "/knowledge", label: "Knowledge Base" },
+  { href: "/campaigns", label: "Campaigns" },
   { href: "/calls", label: "Call History" },
-  { href: "/test", label: "Test Call" },
+  { href: "/test", label: "Make a Call" },
 ]
 
 export function Sidebar() {
@@ -27,7 +28,8 @@ export function Sidebar() {
         {links.map((link) => {
           const isActive =
             pathname === link.href ||
-            (link.href === "/agents" && pathname.startsWith("/agents"))
+            (link.href === "/agents" && pathname.startsWith("/agents")) ||
+            (link.href === "/campaigns" && pathname.startsWith("/campaigns"))
           return (
             <Link
               key={link.href}

@@ -5,22 +5,19 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { apiFetch, apiJson } from "@/lib/api"
 
 interface Agent {
+  id: string
   name: string
-  fromNumber: string
+  company: string
+  phone_number: string
   active: boolean
 }
 
-export default function TestPage() {
-  const [agents, setAgents] = useState<Record<string, Agent>>({})
+export default function MakeCallPage() {
+  const [agents, setAgents] = useState<Agent[]>([])
   const [agentId, setAgentId] = useState("")
   const [phoneNumber, setPhoneNumber] = useState("")
   const [firstName, setFirstName] = useState("")
@@ -29,14 +26,11 @@ export default function TestPage() {
   const [result, setResult] = useState<{ success?: boolean; error?: string; callSid?: string } | null>(null)
 
   useEffect(() => {
-    fetch("/api/agents")
-      .then((r) => r.json())
-      .then((data) => {
-        setAgents(data)
-        const activeIds = Object.entries(data)
-          .filter(([, a]) => (a as Agent).active)
-          .map(([id]) => id)
-        if (activeIds.length === 1) setAgentId(activeIds[0])
+    apiJson<{ agents: Agent[] }>("/agents")
+      .then((d) => {
+        setAgents(d.agents)
+        const active = d.agents.filter((a) => a.active)
+        if (active.length === 1) setAgentId(active[0].id)
       })
       .catch(() => {})
   }, [])
@@ -46,12 +40,16 @@ export default function TestPage() {
     setResult(null)
 
     try {
-      const resp = await fetch("/api/test-call", {
+      const res = await apiFetch("/make-call", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ phoneNumber, firstName, address, agentId }),
+        body: JSON.stringify({
+          to_number: phoneNumber,
+          first_name: firstName,
+          address: address,
+          agent_id: agentId,
+        }),
       })
-      const data = await resp.json()
+      const data = await res.json()
       setResult(data)
     } catch (err) {
       setResult({ error: (err as Error).message })
@@ -62,14 +60,12 @@ export default function TestPage() {
 
   return (
     <div className="max-w-xl">
-      <h1 className="text-lg font-semibold mb-6">Test Call</h1>
+      <h1 className="text-lg font-semibold mb-6">Make a Call</h1>
 
       <Card>
         <CardHeader>
-          <CardTitle className="text-sm font-medium">Trigger Outbound Call</CardTitle>
-          <CardDescription>
-            Send a test call via the voice server running on localhost:5050.
-          </CardDescription>
+          <CardTitle className="text-sm font-medium">Outbound Call</CardTitle>
+          <CardDescription>Initiate a call via the Pipecat voice server.</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="space-y-2">
@@ -79,9 +75,9 @@ export default function TestPage() {
                 <SelectValue placeholder="Select an agent" />
               </SelectTrigger>
               <SelectContent>
-                {Object.entries(agents).map(([id, agent]) => (
-                  <SelectItem key={id} value={id}>
-                    {agent.name} {!agent.active && "(inactive)"}
+                {agents.map((a) => (
+                  <SelectItem key={a.id} value={a.id}>
+                    {a.name} — {a.company} {!a.active && "(inactive)"}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -89,33 +85,18 @@ export default function TestPage() {
           </div>
           <div className="space-y-2">
             <Label>Phone Number</Label>
-            <Input
-              value={phoneNumber}
-              onChange={(e) => setPhoneNumber(e.target.value)}
-              placeholder="+15125551234"
-            />
+            <Input value={phoneNumber} onChange={(e) => setPhoneNumber(e.target.value)} placeholder="+15125551234" />
           </div>
           <div className="space-y-2">
             <Label>First Name</Label>
-            <Input
-              value={firstName}
-              onChange={(e) => setFirstName(e.target.value)}
-              placeholder="John"
-            />
+            <Input value={firstName} onChange={(e) => setFirstName(e.target.value)} placeholder="John" />
           </div>
           <div className="space-y-2">
             <Label>Address</Label>
-            <Input
-              value={address}
-              onChange={(e) => setAddress(e.target.value)}
-              placeholder="123 Main St, Austin TX"
-            />
+            <Input value={address} onChange={(e) => setAddress(e.target.value)} placeholder="123 Main St, Austin TX" />
           </div>
 
-          <Button
-            onClick={handleCall}
-            disabled={calling || !phoneNumber || !firstName || !address || !agentId}
-          >
+          <Button onClick={handleCall} disabled={calling || !phoneNumber || !firstName || !address || !agentId}>
             {calling ? "Calling..." : "Make Call"}
           </Button>
 
@@ -127,9 +108,7 @@ export default function TestPage() {
                 <div>
                   <p>Call initiated successfully.</p>
                   {result.callSid && (
-                    <p className="text-muted-foreground mt-1 font-mono text-xs">
-                      SID: {result.callSid}
-                    </p>
+                    <p className="text-muted-foreground mt-1 font-mono text-xs">SID: {result.callSid}</p>
                   )}
                 </div>
               )}

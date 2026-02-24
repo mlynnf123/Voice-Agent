@@ -2,39 +2,45 @@
 
 import { useEffect, useState } from "react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-
-interface Call {
-  id: string
-  timestamp: string
-  to?: string
-  firstName?: string
-  status?: string
-  agentId?: string
-}
+import { apiJson } from "@/lib/api"
 
 interface Agent {
+  id: string
   name: string
+  company: string
+  phone_number: string
   active: boolean
 }
 
+interface CallLog {
+  id: number
+  agent_id: string
+  call_sid: string
+  to_number: string
+  from_number: string
+  first_name: string
+  status: string
+  created_at: string
+}
+
+interface Stats {
+  total_agents: number
+  total_calls: number
+  calls_today: number
+}
+
 export default function DashboardPage() {
-  const [calls, setCalls] = useState<Call[]>([])
-  const [agents, setAgents] = useState<Record<string, Agent>>({})
+  const [stats, setStats] = useState<Stats>({ total_agents: 0, total_calls: 0, calls_today: 0 })
+  const [agents, setAgents] = useState<Agent[]>([])
+  const [recentCalls, setRecentCalls] = useState<CallLog[]>([])
 
   useEffect(() => {
-    fetch("/api/calls").then((r) => r.json()).then(setCalls).catch(() => {})
-    fetch("/api/agents").then((r) => r.json()).then(setAgents).catch(() => {})
+    apiJson<Stats>("/stats").then(setStats).catch(() => {})
+    apiJson<{ agents: Agent[] }>("/agents").then((d) => setAgents(d.agents)).catch(() => {})
+    apiJson<{ logs: CallLog[] }>("/call-logs?limit=10").then((d) => setRecentCalls(d.logs)).catch(() => {})
   }, [])
 
-  const agentCount = Object.keys(agents).length
-  const activeCount = Object.values(agents).filter((a) => a.active).length
-
-  // Per-agent call counts
-  const agentCallCounts: Record<string, number> = {}
-  for (const call of calls) {
-    const aid = call.agentId || "unknown"
-    agentCallCounts[aid] = (agentCallCounts[aid] || 0) + 1
-  }
+  const agentMap = Object.fromEntries(agents.map((a) => [a.id, a]))
 
   return (
     <div className="max-w-4xl">
@@ -48,7 +54,7 @@ export default function DashboardPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-2xl font-semibold">{calls.length}</p>
+            <p className="text-2xl font-semibold">{stats.total_calls}</p>
           </CardContent>
         </Card>
         <Card>
@@ -58,61 +64,27 @@ export default function DashboardPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-2xl font-semibold">{agentCount}</p>
-            <p className="text-xs text-muted-foreground mt-1">{activeCount} active</p>
+            <p className="text-2xl font-semibold">{stats.total_agents}</p>
           </CardContent>
         </Card>
         <Card>
           <CardHeader>
             <CardTitle className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-              Status
+              Calls Today
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-2xl font-semibold">{activeCount > 0 ? "Online" : "No Agents"}</p>
+            <p className="text-2xl font-semibold">{stats.calls_today}</p>
           </CardContent>
         </Card>
       </div>
-
-      {/* Per-agent call stats */}
-      {agentCount > 0 && (
-        <Card className="mb-8">
-          <CardHeader>
-            <CardTitle className="text-sm font-medium">Calls by Agent</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-border text-left">
-                  <th className="pb-2 font-medium text-muted-foreground">Agent</th>
-                  <th className="pb-2 font-medium text-muted-foreground">Calls</th>
-                </tr>
-              </thead>
-              <tbody>
-                {Object.entries(agents).map(([id, agent]) => (
-                  <tr key={id} className="border-b border-border last:border-0">
-                    <td className="py-2">{agent.name}</td>
-                    <td className="py-2 text-muted-foreground">{agentCallCounts[id] || 0}</td>
-                  </tr>
-                ))}
-                {agentCallCounts["unknown"] && (
-                  <tr className="border-b border-border last:border-0">
-                    <td className="py-2 text-muted-foreground">Unassigned</td>
-                    <td className="py-2 text-muted-foreground">{agentCallCounts["unknown"]}</td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </CardContent>
-        </Card>
-      )}
 
       <Card>
         <CardHeader>
           <CardTitle className="text-sm font-medium">Recent Calls</CardTitle>
         </CardHeader>
         <CardContent>
-          {calls.length === 0 ? (
+          {recentCalls.length === 0 ? (
             <p className="text-sm text-muted-foreground">No calls recorded yet.</p>
           ) : (
             <table className="w-full text-sm">
@@ -126,17 +98,15 @@ export default function DashboardPage() {
                 </tr>
               </thead>
               <tbody>
-                {calls.slice(0, 10).map((call) => (
+                {recentCalls.map((call) => (
                   <tr key={call.id} className="border-b border-border last:border-0">
                     <td className="py-2 text-muted-foreground">
-                      {new Date(call.timestamp).toLocaleString()}
+                      {new Date(call.created_at).toLocaleString()}
                     </td>
-                    <td className="py-2">{call.to || "---"}</td>
-                    <td className="py-2">{call.firstName || "---"}</td>
+                    <td className="py-2">{call.to_number || "---"}</td>
+                    <td className="py-2">{call.first_name || "---"}</td>
                     <td className="py-2 text-muted-foreground">
-                      {call.agentId && agents[call.agentId]
-                        ? agents[call.agentId].name
-                        : "---"}
+                      {agentMap[call.agent_id]?.name || call.agent_id || "---"}
                     </td>
                     <td className="py-2">{call.status || "initiated"}</td>
                   </tr>
